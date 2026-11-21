@@ -401,6 +401,14 @@ class RoundManager:
         self.max_rounds = max_rounds
         self.lock = threading.Lock()
         self.rounds: dict[str, Round] = {}
+        # Slots held by rounds whose schema is still being built.  They count
+        # against max_rounds but are not visible through the API yet.
+        self._initializing = 0
+        self._reserved_ids: set[str] = set()
+        # Schemas whose post-failure cleanup did not succeed; the monitor
+        # keeps retrying so a failed init never leaks objects for good.
+        self._orphans: set[str] = set()
+        self._orphan_retry_at = 0.0
         self._halt = threading.Event()
         self._monitor = threading.Thread(
             target=self._monitor_loop, daemon=True, name="round-monitor")
@@ -410,17 +418,43 @@ class RoundManager:
 
     # ---------------- round lifecycle ----------------
     def create_round(self) -> Round:
+        # 1) Reserve a slot atomically.  Rounds still initializing count
+        #    against the limit, and a rejected request is turned down BEFORE
+        #    any database object is created.
         with self.lock:
-            active = [r for r in self.rounds.values() if r.state != "finished"]
-            if len(active) >= self.max_rounds:
+            active = sum(1 for r in self.rounds.values() if r.state != "finished")
+            if active + self._initializing >= self.max_rounds:
                 raise BusyError(
-                    f"already {len(active)} round(s) in flight; "
+                    f"already {active + self._initializing} round(s) in flight; "
                     f"at most {self.max_rounds} parallel rounds are allowed")
             round_id = uuid.uuid4().hex[:8]
-            schema = f"r_{round_id}"
-        self._create_schema(schema)
+            while round_id in self.rounds or round_id in self._reserved_ids:
+                round_id = uuid.uuid4().hex[:8]
+            self._reserved_ids.add(round_id)
+            self._initializing += 1
+        schema = f"r_{round_id}"
+        try:
+            # 2) The slow setup runs outside the lock, so other rounds keep
+            #    serving queries, SQL steps and stop requests independently.
+            self._create_schema(schema)
+        except Exception:
+            # 3) Init failed: remove any residual objects FIRST, only then
+            #    hand the slot back.
+            try:
+                self.drop_schema(schema)
+            except Exception:
+                with self.lock:
+                    self._orphans.add(schema)  # monitor keeps retrying
+            with self.lock:
+                self._initializing -= 1
+                self._reserved_ids.discard(round_id)
+            raise
         rnd = Round(self, round_id, schema)
         with self.lock:
+            # 4) Only now - batches, readings and the baseline rows all in
+            #    place - does the round become visible through the API.
+            self._initializing -= 1
+            self._reserved_ids.discard(round_id)
             self.rounds[round_id] = rnd
         return rnd
 
@@ -450,7 +484,12 @@ class RoundManager:
         return conn
 
     def _create_schema(self, schema: str) -> None:
-        conn = self._admin_connect()
+        """Build the round's schema and load the baseline in ONE transaction.
+
+        Either the batches table, the readings table and all sample rows
+        exist together, or nothing does - a failed init never leaves a
+        half-built schema behind."""
+        conn = psycopg2.connect(self.dsn)
         try:
             with conn.cursor() as cur:
                 cur.execute(f'CREATE SCHEMA "{schema}"')
@@ -469,6 +508,10 @@ class RoundManager:
                     f'INSERT INTO "{schema}".readings(id, batch_id, value)'
                     " VALUES (%s, %s, %s)",
                     BASELINE_READINGS)
+            conn.commit()
+        except Exception:
+            conn.rollback()  # undoes CREATE SCHEMA too - nothing half-built
+            raise
         finally:
             conn.close()
 
@@ -490,6 +533,23 @@ class RoundManager:
                 elif rnd.state == "stopping":
                     self._check_stuck_round(rnd, now)
                     rnd._maybe_finish()  # retries a failed cleanup
+            self._retry_orphans(now)
+
+    def _retry_orphans(self, now: float) -> None:
+        """Best-effort cleanup of schemas left by failed initializations
+        whose immediate drop did not succeed (e.g. a DB hiccup)."""
+        with self.lock:
+            if not self._orphans or now < self._orphan_retry_at:
+                return
+            self._orphan_retry_at = now + 2.0
+            orphans = sorted(self._orphans)
+        for schema in orphans:
+            try:
+                self.drop_schema(schema)
+            except Exception:
+                continue  # keep it in the set; retried on the next pass
+            with self.lock:
+                self._orphans.discard(schema)
 
     def _check_step_timeout(self, rnd: Round, now: float) -> None:
         with rnd.lock:

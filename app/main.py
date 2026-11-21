@@ -91,7 +91,8 @@ def root():
 
 
 @app.post("/rounds", status_code=201, tags=["rounds"],
-          summary="Create a round, reset to the baseline data")
+          summary="Create a round, reset to the baseline data",
+          responses={409: {"description": "Parallel-round limit reached"}})
 def create_round():
     """Creates a new round with its own schema preloaded with the baseline:
 
@@ -99,7 +100,13 @@ def create_round():
     - `readings`: `(1,1,10.5)`, `(2,1,11.0)`, `(3,1,9.8)`
 
     At most two rounds may be in flight at the same time; data and
-    connections are never shared between rounds.
+    connections are never shared between rounds.  A round still being
+    initialized already counts against the limit: once the limit is
+    reached, the request is rejected with 409 before any database object
+    is created.  The new round becomes visible through the API only after
+    the schema, both tables and the baseline rows are all in place; if
+    initialization fails, leftover objects are removed before the slot is
+    handed back.
     """
     try:
         rnd = manager.create_round()
